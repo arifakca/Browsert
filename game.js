@@ -5,10 +5,10 @@
 const CANVAS_W = 1024;
 const CANVAS_H = 640;
 const SOLDIER_RADIUS = 10;
-const SEPARATION_R = 22;
+const SEPARATION_R = 30;
 const SOLDIER_SPEED = 60;
 const SOLDIER_HP = 50;
-const ATTACK_RANGE = 30;
+const ATTACK_RANGE = 34;
 const ATTACK_DAMAGE = 8;
 const ATTACK_COOLDOWN = 0.6;
 const NET_HZ = 15;
@@ -116,7 +116,7 @@ function seedHostFromView() {
     }
     world.soldiers = (lastSnapshot.soldiers || []).map(s => ({
       id: s.id, owner: s.owner, x: s.x, y: s.y, hp: s.hp,
-      target: null, attackTarget: null, cooldown: 0,
+      target: null, attackTarget: null, commandedAttackTarget: null, cooldown: 0,
     }));
     nextSoldierId = world.soldiers.reduce((m, s) => Math.max(m, s.id), 0) + 1;
     world.gameOver = lastSnapshot.gameOver || null;
@@ -171,6 +171,7 @@ function spawnSoldiersFor(ownerId, center) {
       hp: SOLDIER_HP,
       target: null,
       attackTarget: null,
+      commandedAttackTarget: null,
       cooldown: 0,
     });
   }
@@ -231,18 +232,30 @@ onCmdHandler = (msg, fromId) => {
 function applyPendingCommands() {
   while (cmdQueue.length > 0) {
     const { fromId, msg } = cmdQueue.shift();
-    if (!msg.target) continue;
-    const wanted = new Set(msg.ids);
-    const matches = world.soldiers.filter(s => s.owner === fromId && wanted.has(s.id));
-    const offsets = formationOffsets(matches.length);
-    matches.forEach((s, i) => {
-      const [dx, dy] = offsets[i] || [0, 0];
-      s.target = {
-        x: clamp(msg.target.x + dx, SOLDIER_RADIUS, CANVAS_W - SOLDIER_RADIUS),
-        y: clamp(msg.target.y + dy, SOLDIER_RADIUS, CANVAS_H - SOLDIER_RADIUS),
-      };
-      s.attackTarget = null;
-    });
+    if (!msg) continue;
+    const wanted = new Set(msg.ids || []);
+    if (msg.kind === 'move' && msg.target) {
+      const matches = world.soldiers.filter(s => s.owner === fromId && wanted.has(s.id));
+      const offsets = formationOffsets(matches.length);
+      matches.forEach((s, i) => {
+        const [dx, dy] = offsets[i] || [0, 0];
+        s.target = {
+          x: clamp(msg.target.x + dx, SOLDIER_RADIUS, CANVAS_W - SOLDIER_RADIUS),
+          y: clamp(msg.target.y + dy, SOLDIER_RADIUS, CANVAS_H - SOLDIER_RADIUS),
+        };
+        s.attackTarget = null;
+        s.commandedAttackTarget = null;
+      });
+    } else if (msg.kind === 'attack' && msg.enemyId != null) {
+      const enemy = world.soldiers.find(s => s.id === msg.enemyId);
+      if (!enemy || enemy.owner === fromId) continue;
+      for (const s of world.soldiers) {
+        if (s.owner !== fromId || !wanted.has(s.id)) continue;
+        s.commandedAttackTarget = msg.enemyId;
+        s.target = { x: enemy.x, y: enemy.y };
+        s.attackTarget = null;
+      }
+    }
   }
 }
 
@@ -263,10 +276,25 @@ function simulationStep(now) {
     aiRetarget();
   }
 
+  refreshCommandedAttackTargets();
   updateMovement(dt);
   applySeparation();
   updateCombat(dt);
   checkWin();
+}
+
+function refreshCommandedAttackTargets() {
+  const byId = new Map();
+  for (const s of world.soldiers) byId.set(s.id, s);
+  for (const s of world.soldiers) {
+    if (s.commandedAttackTarget == null) continue;
+    const t = byId.get(s.commandedAttackTarget);
+    if (!t || t.hp <= 0) {
+      s.commandedAttackTarget = null;
+      continue;
+    }
+    s.target = { x: t.x, y: t.y };
+  }
 }
 
 function aiRetarget() {
@@ -330,18 +358,24 @@ function updateCombat(dt) {
   for (const s of world.soldiers) {
     s.cooldown = Math.max(0, s.cooldown - dt);
 
-    if (s.attackTarget != null) {
-      const t = byId.get(s.attackTarget);
-      if (!t || t.hp <= 0 || dist(s, t) > ATTACK_RANGE) s.attackTarget = null;
-    }
-    if (s.attackTarget == null) {
-      let best = null, bd = (ATTACK_RANGE * 1.5) ** 2;
-      for (const t of world.soldiers) {
-        if (t === s || t.owner === s.owner || t.hp <= 0) continue;
-        const d2 = (t.x - s.x) ** 2 + (t.y - s.y) ** 2;
-        if (d2 < bd) { bd = d2; best = t; }
+    if (s.commandedAttackTarget != null) {
+      // Player-issued attack command overrides auto-acquire entirely.
+      const t = byId.get(s.commandedAttackTarget);
+      s.attackTarget = (t && t.hp > 0 && dist(s, t) <= ATTACK_RANGE) ? t.id : null;
+    } else {
+      if (s.attackTarget != null) {
+        const t = byId.get(s.attackTarget);
+        if (!t || t.hp <= 0 || dist(s, t) > ATTACK_RANGE) s.attackTarget = null;
       }
-      if (best) s.attackTarget = best.id;
+      if (s.attackTarget == null) {
+        let best = null, bd = (ATTACK_RANGE * 1.5) ** 2;
+        for (const t of world.soldiers) {
+          if (t === s || t.owner === s.owner || t.hp <= 0) continue;
+          const d2 = (t.x - s.x) ** 2 + (t.y - s.y) ** 2;
+          if (d2 < bd) { bd = d2; best = t; }
+        }
+        if (best) s.attackTarget = best.id;
+      }
     }
     if (s.attackTarget != null && s.cooldown === 0) {
       const t = byId.get(s.attackTarget);
@@ -436,10 +470,16 @@ function soldierAt(p) {
 }
 
 canvas.addEventListener('pointerdown', e => {
-  // Right-click on mouse: dedicated move command, regardless of selection ambiguity.
+  // Right-click on mouse: dedicated move command, or attack if it lands on an enemy.
   if (e.pointerType === 'mouse' && e.button === 2) {
     e.preventDefault();
-    issueMove(getPoint(e));
+    const p = getPoint(e);
+    const onSoldier = soldierAt(p);
+    if (onSoldier && onSoldier.owner !== selfId && onSoldier.owner !== undefined) {
+      issueAttack(onSoldier.id);
+    } else {
+      issueMove(p);
+    }
     return;
   }
   // Only the primary button (mouse left, touch, pen tip) starts a gesture.
@@ -468,20 +508,32 @@ function endGesture(e, cancelled) {
 
   const drag = Math.hypot(dragEnd.x - dragStart.x, dragEnd.y - dragStart.y);
   const shift = !!e.shiftKey;
+  const startSoldier = soldierAt(dragStart);
+  const endSoldier = soldierAt(dragEnd);
+  const isOwn = s => s && s.owner === selfId;
+  const isEnemy = s => s && s.owner !== selfId;
 
   if (drag < 4) {
-    // Tap: select own unit, or issue a move if we already had own units selected.
-    const tappedSoldier = soldierAt(dragEnd);
-    if (tappedSoldier && tappedSoldier.owner === selfId) {
+    // Tap.
+    if (isOwn(endSoldier)) {
       if (!shift) selected.clear();
-      selected.add(tappedSoldier.id);
+      selected.add(endSoldier.id);
+    } else if (isEnemy(endSoldier) && hadSelectionAtDown) {
+      issueAttack(endSoldier.id);
     } else if (hadSelectionAtDown) {
       issueMove(dragEnd);
     } else if (!shift) {
       selected.clear();
     }
+  } else if (isOwn(startSoldier) && isEnemy(endSoldier)) {
+    // Drag from your own soldier onto an enemy: attack-command.
+    if (!hadSelectionAtDown) {
+      if (!shift) selected.clear();
+      selected.add(startSoldier.id);
+    }
+    issueAttack(endSoldier.id);
   } else {
-    // Drag: rectangle-select own units.
+    // Plain rectangle box-select of own units.
     if (!shift) selected.clear();
     const x1 = Math.min(dragStart.x, dragEnd.x);
     const y1 = Math.min(dragStart.y, dragEnd.y);
@@ -506,6 +558,21 @@ function issueMove(p) {
   const ids = [...selected].filter(id => owned.has(id));
   if (ids.length === 0) return;
   const msg = { kind: 'move', ids, target: { x: p.x, y: p.y } };
+  if (isHost) {
+    cmdQueue.push({ fromId: selfId, msg });
+  } else {
+    sendCmd(msg, lowestPeerId());
+  }
+}
+
+function issueAttack(enemyId) {
+  if (selected.size === 0) return;
+  const enemy = viewSoldiers().find(s => s.id === enemyId);
+  if (!enemy || enemy.owner === selfId) return;
+  const owned = new Set(viewSoldiers().filter(s => s.owner === selfId).map(s => s.id));
+  const ids = [...selected].filter(id => owned.has(id));
+  if (ids.length === 0) return;
+  const msg = { kind: 'attack', ids, enemyId };
   if (isHost) {
     cmdQueue.push({ fromId: selfId, msg });
   } else {
