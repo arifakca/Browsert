@@ -4,11 +4,11 @@
 
 const CANVAS_W = 1024;
 const CANVAS_H = 640;
-const SOLDIER_RADIUS = 10;
-const SEPARATION_R = 30;
+const SOLDIER_RADIUS = 20;
+const SEPARATION_R = 50;
 const SOLDIER_SPEED = 60;
 const SOLDIER_HP = 50;
-const ATTACK_RANGE = 34;
+const ATTACK_RANGE = 56;
 const ATTACK_DAMAGE = 8;
 const ATTACK_COOLDOWN = 0.6;
 const NET_HZ = 15;
@@ -607,7 +607,7 @@ function render() {
     ctx.lineWidth = 1.5;
     ctx.strokeStyle = '#000';
     ctx.stroke();
-    const w = 18, h = 3;
+    const w = 36, h = 4;
     const ratio = Math.max(0, s.hp) / SOLDIER_HP;
     ctx.fillStyle = '#222';
     ctx.fillRect(s.x - w / 2, s.y - SOLDIER_RADIUS - 7, w, h);
