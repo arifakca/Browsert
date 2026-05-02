@@ -395,14 +395,21 @@ onStateHandler = (snap, fromId) => {
 // --- Input / view ---
 const selected = new Set();
 let dragStart = null, dragEnd = null;
-let mouseDown = false;
+let activePointerId = null;
+let hadSelectionAtDown = false;
 
-function getMouse(e) {
+function getPoint(e) {
   const rect = canvas.getBoundingClientRect();
   return {
     x: (e.clientX - rect.left) * (CANVAS_W / rect.width),
     y: (e.clientY - rect.top) * (CANVAS_H / rect.height),
   };
+}
+
+function ownedSelectedCount() {
+  let n = 0;
+  for (const s of viewSoldiers()) if (s.owner === selfId && selected.has(s.id)) n++;
+  return n;
 }
 
 function viewSoldiers() {
@@ -428,31 +435,54 @@ function soldierAt(p) {
   return null;
 }
 
-canvas.addEventListener('mousedown', e => {
-  const m = getMouse(e);
-  if (e.button === 0) {
-    mouseDown = true;
-    dragStart = m;
-    dragEnd = m;
-  } else if (e.button === 2) {
-    issueMove(m);
+canvas.addEventListener('pointerdown', e => {
+  // Right-click on mouse: dedicated move command, regardless of selection ambiguity.
+  if (e.pointerType === 'mouse' && e.button === 2) {
+    e.preventDefault();
+    issueMove(getPoint(e));
+    return;
   }
+  // Only the primary button (mouse left, touch, pen tip) starts a gesture.
+  if (e.button !== 0 && e.button !== -1 && e.button !== undefined) return;
+  // Ignore secondary touches while a gesture is in progress.
+  if (activePointerId !== null) return;
+  e.preventDefault();
+  activePointerId = e.pointerId;
+  canvas.setPointerCapture(e.pointerId);
+  const p = getPoint(e);
+  dragStart = p;
+  dragEnd = p;
+  hadSelectionAtDown = ownedSelectedCount() > 0;
 });
 
-canvas.addEventListener('mousemove', e => {
-  if (mouseDown) dragEnd = getMouse(e);
+canvas.addEventListener('pointermove', e => {
+  if (e.pointerId !== activePointerId) return;
+  dragEnd = getPoint(e);
 });
 
-canvas.addEventListener('mouseup', e => {
-  if (e.button !== 0) return;
-  mouseDown = false;
-  if (!dragStart || !dragEnd) { dragStart = dragEnd = null; return; }
+function endGesture(e, cancelled) {
+  if (e.pointerId !== activePointerId) return;
+  if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+  activePointerId = null;
+  if (cancelled || !dragStart || !dragEnd) { dragStart = dragEnd = null; return; }
+
   const drag = Math.hypot(dragEnd.x - dragStart.x, dragEnd.y - dragStart.y);
-  if (!e.shiftKey) selected.clear();
+  const shift = !!e.shiftKey;
+
   if (drag < 4) {
-    const s = soldierAt(dragEnd);
-    if (s && s.owner === selfId) selected.add(s.id);
+    // Tap: select own unit, or issue a move if we already had own units selected.
+    const tappedSoldier = soldierAt(dragEnd);
+    if (tappedSoldier && tappedSoldier.owner === selfId) {
+      if (!shift) selected.clear();
+      selected.add(tappedSoldier.id);
+    } else if (hadSelectionAtDown) {
+      issueMove(dragEnd);
+    } else if (!shift) {
+      selected.clear();
+    }
   } else {
+    // Drag: rectangle-select own units.
+    if (!shift) selected.clear();
     const x1 = Math.min(dragStart.x, dragEnd.x);
     const y1 = Math.min(dragStart.y, dragEnd.y);
     const x2 = Math.max(dragStart.x, dragEnd.x);
@@ -463,13 +493,12 @@ canvas.addEventListener('mouseup', e => {
     }
   }
   dragStart = dragEnd = null;
-});
+}
+
+canvas.addEventListener('pointerup', e => endGesture(e, false));
+canvas.addEventListener('pointercancel', e => endGesture(e, true));
 
 canvas.addEventListener('contextmenu', e => e.preventDefault());
-
-window.addEventListener('mouseup', e => {
-  if (e.button === 0) mouseDown = false;
-});
 
 function issueMove(p) {
   if (selected.size === 0) return;
